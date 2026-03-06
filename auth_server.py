@@ -17,9 +17,7 @@ import os
 app = Flask(__name__)
 
 # ── Konstanta Garena ──────────────────────────────────────────────────────────
-# Set environment variable MASTER_KEY_HEX di Railway/Render
-# Jangan hardcode di sini jika repo public!
-MASTER_KEY = bytes.fromhex(_hex)
+_hex = os.environ.get("MASTER_KEY_HEX")
 
 GARENA_URL = "https://100067.connect.garena.com/oauth/guest/token/grant"
 HEADERS = {
