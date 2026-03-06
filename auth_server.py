@@ -1,119 +1,94 @@
-from flask import Flask, request, jsonify
-import jwt
-import datetime
-import hashlib
-import os
-from functools import wraps
-from dotenv import load_dotenv
+"""
+auth_server.py — Garena Auth Server untuk AUTH_URL
+Menerima: GET /token?uid=xxx&password=xxx
+Return:   {"token": "eyJhbGci..."}
 
-load_dotenv()
+Deploy di Railway/Render sebagai service terpisah.
+"""
+
+from flask import Flask, request, jsonify
+import requests
+import hmac
+import hashlib
+import base64
+import json
+import os
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'fallback-secret-key-ganti-dengan-yang-kuat')
-app.config['JWT_EXPIRATION_HOURS'] = int(os.getenv('JWT_EXPIRATION_HOURS', 24))
 
-# Simulasi database users (dalam production pakai database sungguhan)
-users_db = {
-    "uid123": {
-        "password_hash": hashlib.sha256("password123".encode()).hexdigest(),
-        "ff_api_key": "ff_api_key_untuk_uid123"
-    },
-    "uid456": {
-        "password_hash": hashlib.sha256("pass456".encode()).hexdigest(),
-        "ff_api_key": "ff_api_key_lain"
-    }
+# ── Konstanta Garena ──────────────────────────────────────────────────────────
+# Set MASTER_KEY_HEX di Railway environment variables (optional, sudah ada default)
+MASTER_KEY = bytes.fromhex(os.environ.get("MASTER_KEY_HEX")
+GARENA_URL = "https://100067.connect.garena.com/oauth/guest/token/grant"
+HEADERS = {
+    "Accept-Encoding": "gzip",
+    "Connection":      "Keep-Alive",
+    "Content-Type":    "application/x-www-form-urlencoded",
+    "Host":            "100067.connect.garena.com",
+    "User-Agent":      "GarenaMSDK/4.0.19P8(ASUS_Z01QD ;Android 12;en;US;)",
 }
 
-def hash_password(password):
-    """Hash password dengan salt"""
-    salt = app.config['SECRET_KEY'].encode()
-    return hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000).hex()
+# ── Ambil JWT dari FF token ───────────────────────────────────────────────────
 
-def token_required(f):
-    """Decorator untuk proteksi endpoint dengan JWT"""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get('Authorization')
-        
-        if not token:
-            return jsonify({'message': 'Token is missing!'}), 401
-        
-        try:
-            # Hapus "Bearer " jika ada
-            if token.startswith('Bearer '):
-                token = token[7:]
-            
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            current_user = data['uid']
-        except jwt.ExpiredSignatureError:
-            return jsonify({'message': 'Token has expired!'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'message': 'Invalid token!'}), 401
-        
-        return f(current_user, *args, **kwargs)
-    
-    return decorated
+def get_ff_jwt(access_token: str) -> str | None:
+    """Extract JWT dari FF login response menggunakan access_token."""
+    try:
+        # Decode JWT payload dari access_token (token Garena sudah berisi info)
+        # Return access_token langsung — ini yang dipakai sebagai Bearer di API
+        return access_token
+    except Exception:
+        return None
 
-@app.route('/login', methods=['POST'])
-def login():
-    """Endpoint login, mengembalikan JWT token"""
-    data = request.get_json()
-    
-    uid = data.get('uid')
-    password = data.get('password')
-    
+
+def garena_token(uid: str, password: str) -> str | None:
+    """Hit Garena auth dan return access_token."""
+    try:
+        body = {
+            "uid":           uid,
+            "password":      password,
+            "response_type": "token",
+            "client_type":   "2",
+            "client_secret": MASTER_KEY,
+            "client_id":     "100067",
+        }
+        r = requests.post(GARENA_URL, headers=HEADERS, data=body, timeout=15)
+        rj = r.json()
+
+        if "access_token" in rj:
+            return rj["access_token"]
+        else:
+            print(f"[AUTH] Garena error for uid {uid}: {rj}")
+            return None
+    except Exception as e:
+        print(f"[AUTH] Exception for uid {uid}: {e}")
+        return None
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.route("/token")
+def get_token():
+    uid      = request.args.get("uid")
+    password = request.args.get("password")
+
     if not uid or not password:
-        return jsonify({'message': 'UID and password required'}), 400
-    
-    # Cari user di database
-    user = users_db.get(uid)
-    if not user:
-        return jsonify({'message': 'User not found'}), 404
-    
-    # Verifikasi password
-    password_hash = hash_password(password)
-    if password_hash != user['password_hash']:
-        return jsonify({'message': 'Invalid password'}), 401
-    
-    # Buat JWT token
-    token = jwt.encode({
-        'uid': uid,
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=app.config['JWT_EXPIRATION_HOURS']),
-        'iat': datetime.datetime.utcnow()
-    }, app.config['SECRET_KEY'], algorithm='HS256')
-    
-    return jsonify({
-        'token': token,
-        'expires_in': app.config['JWT_EXPIRATION_HOURS'] * 3600  # dalam detik
-    })
+        return jsonify({"error": "uid and password required"}), 400
 
-@app.route('/refresh', methods=['POST'])
-@token_required
-def refresh(current_user):
-    """Refresh token yang masih valid"""
-    new_token = jwt.encode({
-        'uid': current_user,
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=app.config['JWT_EXPIRATION_HOURS']),
-        'iat': datetime.datetime.utcnow()
-    }, app.config['SECRET_KEY'], algorithm='HS256')
-    
-    return jsonify({'token': new_token})
+    token = garena_token(uid, password)
 
-@app.route('/protected', methods=['GET'])
-@token_required
-def protected(current_user):
-    """Contoh endpoint yang dilindungi"""
-    return jsonify({'message': f'Hello {current_user}! This is protected data.'})
-
-@app.route('/get_ff_api_key', methods=['GET'])
-@token_required
-def get_ff_api_key(current_user):
-    """Mengembalikan API key Free Fire untuk user yang terautentikasi"""
-    user = users_db.get(current_user)
-    if user and 'ff_api_key' in user:
-        return jsonify({'ff_api_key': user['ff_api_key']})
+    if token:
+        return jsonify({"token": token})
     else:
-        return jsonify({'message': 'API key not found'}), 404
+        return jsonify({"error": "Failed to get token from Garena"}), 500
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+
+@app.route("/")
+def home():
+    return jsonify({"status": "Auth server running"})
+
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port, debug=False)
